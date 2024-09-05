@@ -902,8 +902,11 @@ def main_trading_routine():
                 lower_timeframe_signals, rsi = analyze_lower_timeframes(symbol, trade_setups[symbol][0]['action'])
                 
             # Execute trades or adjust positions based on new analysis
+            # for signal in lower_timeframe_signals:
+                # if signal == 'buy' or signal == 'sell':
+
             for signal in lower_timeframe_signals:
-                if signal == 'buy' or signal == 'sell':
+                if signal in ['buy', 'sell']:
                     execute_trades(symbol, trade_setups[symbol], rsi, bias)
 
 
