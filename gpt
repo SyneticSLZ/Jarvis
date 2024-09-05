@@ -1,0 +1,933 @@
+import time
+import logging
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+import ccxt
+import yfinance as yf
+import requests
+from alpaca_trade_api.rest import REST, TimeFrame, TimeFrameUnit
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.datasets import fetch_20newsgroups
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv()
+ALPACA_API_KEY = os.getenv('ALPACA_API_KEY')
+ALPACA_API_SECRET = os.getenv('ALPACA_API_SECRET')
+ALPACA_BASE_URL = os.getenv('ALPACA_BASE_URL', 'https://paper-api.alpaca.markets')
+NEWS_API_KEY = os.getenv('NEWS_API_KEY')
+
+# Initialize logging
+from logging.handlers import RotatingFileHandler
+handler = RotatingFileHandler('trading_algorithm.log', maxBytes=5*1024*1024, backupCount=5)
+logging.basicConfig(handlers=[handler], level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Initialize Alpaca API
+api = REST(ALPACA_API_KEY, ALPACA_API_SECRET, base_url=ALPACA_BASE_URL)
+
+# Initialize data structures to track performance
+portfolio = {}
+trade_history = []
+net_profit_loss = 0
+
+# Initialize sentiment analysis model
+def initialize_sentiment_model():
+    try:
+        logging.info("Initializing sentiment analysis model...")
+        categories = ['rec.sport.baseball', 'rec.sport.hockey']
+        data = fetch_20newsgroups(subset='train', categories=categories)
+        pipeline = Pipeline([
+            ('vectorizer', CountVectorizer()),
+            ('classifier', MultinomialNB())
+        ])
+        pipeline.fit(data.data, data.target)
+        logging.info("Sentiment analysis model initialized successfully.")
+        return pipeline
+    except Exception as e:
+        logging.error(f"Error initializing sentiment model: {e}")
+        return None
+
+sentiment_model = initialize_sentiment_model()
+
+##############################################
+#                Data Fetching               #
+##############################################
+
+def fetch_trending_stocks(limit=10):
+    """
+    Fetch trending stocks based on highest volume from Yahoo Finance.
+    """
+    try:
+        logging.info("Fetching trending stocks...")
+        # Fetch S&P 500 tickers
+        sp500_tickers = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]['Symbol'].tolist()
+        
+        # Fetch market data for these tickers
+        data = yf.download(sp500_tickers, period='1d', group_by='ticker', threads=True, progress=False)
+        
+        # Calculate average volume and sort
+        avg_volumes = {}
+        for ticker in sp500_tickers:
+            try:
+                avg_volume = data[ticker]['Volume'].mean()
+                avg_volumes[ticker] = avg_volume
+            except Exception as e:
+                continue
+        
+        # Sort tickers by volume
+        sorted_tickers = sorted(avg_volumes.items(), key=lambda x: x[1], reverse=True)
+        trending_stocks = [ticker for ticker, volume in sorted_tickers[:limit]]
+        
+        logging.info(f"Trending stocks fetched: {trending_stocks}")
+        return trending_stocks
+    except Exception as e:
+        logging.error(f"Error fetching trending stocks: {e}")
+        return []
+
+def fetch_data(symbol, timeframe='1D', limit=100):
+    """
+    Fetch historical market data for a given symbol and timeframe.
+    """
+    try:
+        logging.info(f"Fetching data for {symbol} with timeframe {timeframe}...")
+        timeframe_map = {
+            '1D': TimeFrame.Day,
+            '1H': TimeFrame.Hour,
+            '15M': TimeFrame(15, TimeFrameUnit.Minute)
+        }
+        bars = api.get_bars(symbol, timeframe_map[timeframe], limit=limit).df
+        bars = bars.tz_convert('US/Eastern')
+        logging.info(f"Data fetched for {symbol}: {len(bars)} bars.")
+        return bars
+    except Exception as e:
+        logging.error(f"Error fetching data for {symbol}: {e}")
+        return None
+
+def fetch_news(symbol, from_date=None, to_date=None, language='en'):
+    """
+    Fetch recent news articles for a given stock symbol from News API.
+    """
+    try:
+        logging.info(f"Fetching news for {symbol}...")
+        if from_date is None:
+            from_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        if to_date is None:
+            to_date = datetime.now().strftime('%Y-%m-%d')
+        
+        url = (
+            f"https://newsapi.org/v2/everything?"
+            f"q={symbol}&from={from_date}&to={to_date}&language={language}&sortBy=publishedAt&apiKey={NEWS_API_KEY}"
+        )
+        response = requests.get(url)
+        response.raise_for_status()
+        articles = response.json().get('articles', [])
+        logging.info(f"Fetched {len(articles)} articles for {symbol}.")
+        return articles
+    except Exception as e:
+        logging.error(f"Error fetching news for {symbol}: {e}")
+        return []
+
+##############################################
+#            Technical Indicators            #
+##############################################
+
+def calculate_rsi(prices, period=14):
+    """
+    Calculate Relative Strength Index (RSI) for a series of prices.
+    """
+    try:
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    except Exception as e:
+        logging.error(f"Error calculating RSI: {e}")
+        return pd.Series()
+
+def calculate_macd(prices):
+    """
+    Calculate Moving Average Convergence Divergence (MACD) for a series of prices.
+    """
+    try:
+        ema12 = prices.ewm(span=12, adjust=False).mean()
+        ema26 = prices.ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        signal = macd.ewm(span=9, adjust=False).mean()
+        histogram = macd - signal
+        return macd, signal, histogram
+    except Exception as e:
+        logging.error(f"Error calculating MACD: {e}")
+        return pd.Series(), pd.Series(), pd.Series()
+
+def calculate_bollinger_bands(prices, window=20):
+    """
+    Calculate Bollinger Bands for a series of prices.
+    """
+    try:
+        sma = prices.rolling(window=window).mean()
+        std = prices.rolling(window=window).std()
+        upper_band = sma + (std * 2)
+        lower_band = sma - (std * 2)
+        return upper_band, sma, lower_band
+    except Exception as e:
+        logging.error(f"Error calculating Bollinger Bands: {e}")
+        return pd.Series(), pd.Series(), pd.Series()
+
+def calculate_indicators(data):
+    """
+    Calculate all necessary technical indicators and add them to the data DataFrame.
+    """
+    try:
+        data = data.copy()
+        data['RSI'] = calculate_rsi(data['close'])
+        data['MACD'], data['MACD_Signal'], data['MACD_Hist'] = calculate_macd(data['close'])
+        data['MA_50'] = data['close'].rolling(window=50).mean()
+        data['MA_200'] = data['close'].rolling(window=200).mean()
+        data['Upper_Band'], data['Middle_Band'], data['Lower_Band'] = calculate_bollinger_bands(data['close'])
+        logging.info("Technical indicators calculated.")
+        return data
+    except Exception as e:
+        logging.error(f"Error calculating indicators: {e}")
+        return data
+
+##############################################
+#          Advanced Pattern Detection        #
+##############################################
+
+def detect_divergence(data):
+    """
+    Detect bullish or bearish divergences between price and RSI.
+    """
+    try:
+        divergence_signals = []
+        # Ensure sufficient data
+        if len(data) < 30:
+            return divergence_signals
+        
+        # Recent price and RSI changes
+        price_diff = data['close'].iloc[-3:] - data['close'].iloc[-4:-1]
+        rsi_diff = data['RSI'].iloc[-3:] - data['RSI'].iloc[-4:-1]
+        
+        # Bullish divergence: price makes lower lows, RSI makes higher lows
+        if price_diff.iloc[-1] < 0 and rsi_diff.iloc[-1] > 0:
+            divergence_signals.append('bullish divergence')
+        
+        # Bearish divergence: price makes higher highs, RSI makes lower highs
+        if price_diff.iloc[-1] > 0 and rsi_diff.iloc[-1] < 0:
+            divergence_signals.append('bearish divergence')
+        
+        logging.info(f"Divergence signals: {divergence_signals}")
+        return divergence_signals
+    except Exception as e:
+        logging.error(f"Error detecting divergence: {e}")
+        return []
+
+def detect_smt(data, related_symbol='SPY'):
+    """
+    Detect Smart Money Techniques (SMT) using price correlation with a related symbol.
+    """
+    try:
+        logging.info("Detecting Smart Money Techniques (SMT)...")
+        related_data = fetch_data(related_symbol, timeframe='1D', limit=100)
+        if related_data is None:
+            return []
+        
+        combined_data = pd.merge(data, related_data, left_index=True, right_index=True, suffixes=('', '_related'))
+        correlation = combined_data['close'].corr(combined_data['close_related'])
+        
+        # Simple threshold-based detection
+        if correlation < -0.5:
+            logging.info(f"Detected potential SMT: correlation={correlation:.2f}")
+            return ['smt']
+        return []
+    except Exception as e:
+        logging.error(f"Error detecting SMT: {e}")
+        return []
+
+def detect_fvg(data):
+    """
+    Detect Fair Value Gaps (FVG) in price data.
+    """
+    try:
+        logging.info("Detecting Fair Value Gaps (FVG)...")
+        fvg_signals = []
+        if len(data) < 30:
+            return fvg_signals
+        
+        gaps = data['close'].diff().dropna()
+        for i in range(1, len(gaps)):
+            if gaps.iloc[i] > gaps.iloc[i-1] * 1.05:
+                fvg_signals.append('bullish gap')
+            elif gaps.iloc[i] < gaps.iloc[i-1] * -1.05:
+                fvg_signals.append('bearish gap')
+        
+        logging.info(f"FVG signals: {fvg_signals}")
+        return fvg_signals
+    except Exception as e:
+        logging.error(f"Error detecting FVG: {e}")
+        return []
+
+##############################################
+#               Trading Algorithm            #
+##############################################
+
+def generate_signals(data):
+    """
+    Generate trading signals based on technical indicators and patterns.
+    """
+    try:
+        signals = []
+        data = calculate_indicators(data)
+        
+        # Check moving average cross
+        if data['MA_50'].iloc[-1] > data['MA_200'].iloc[-1]:
+            signals.append('buy')
+        elif data['MA_50'].iloc[-1] < data['MA_200'].iloc[-1]:
+            signals.append('sell')
+        
+        # Check RSI levels
+        if data['RSI'].iloc[-1] < 30:
+            signals.append('buy')
+        elif data['RSI'].iloc[-1] > 70:
+            signals.append('sell')
+        
+        # Check MACD cross
+        if data['MACD'].iloc[-1] > data['MACD_Signal'].iloc[-1]:
+            signals.append('buy')
+        elif data['MACD'].iloc[-1] < data['MACD_Signal'].iloc[-1]:
+            signals.append('sell')
+        
+        # Check for divergences
+        divergence_signals = detect_divergence(data)
+        signals.extend(divergence_signals)
+        
+        # Check for SMT
+        smt_signals = detect_smt(data)
+        signals.extend(smt_signals)
+        
+        # Check for FVG
+        fvg_signals = detect_fvg(data)
+        signals.extend(fvg_signals)
+        
+        logging.info(f"Generated signals: {signals}")
+        return signals
+    except Exception as e:
+        logging.error(f"Error generating signals: {e}")
+        return []
+
+def execute_trade(signal, symbol, quantity=1):
+    """
+    Execute a trade based on the generated signal.
+    """
+    try:
+        logging.info(f"Executing trade signal: {signal} for {symbol}")
+        if signal == 'buy':
+            api.submit_order(
+                symbol=symbol,
+                qty=quantity,
+                side='buy',
+                type='market',
+                time_in_force='gtc'
+            )
+            logging.info(f"Executed buy order for {symbol}.")
+        elif signal == 'sell':
+            api.submit_order(
+                symbol=symbol,
+                qty=quantity,
+                side='sell',
+                type='market',
+                time_in_force='gtc'
+            )
+            logging.info(f"Executed sell order for {symbol}.")
+        else:
+            logging.info(f"No valid trade signal for {symbol}.")
+    except Exception as e:
+        logging.error(f"Error executing trade for {symbol}: {e}")
+
+def update_portfolio(symbol, action, quantity):
+    """
+    Update the portfolio with the latest trade details.
+    """
+    global portfolio
+    if symbol not in portfolio:
+        portfolio[symbol] = {'quantity': 0, 'average_price': 0}
+    
+    if action == 'buy':
+        current_price = yf.Ticker(symbol).info['last_price']
+        total_cost = portfolio[symbol]['average_price'] * portfolio[symbol]['quantity']
+        new_quantity = portfolio[symbol]['quantity'] + quantity
+        new_average_price = (total_cost + current_price * quantity) / new_quantity
+        portfolio[symbol]['quantity'] = new_quantity
+        portfolio[symbol]['average_price'] = new_average_price
+    elif action == 'sell':
+        portfolio[symbol]['quantity'] -= quantity
+        if portfolio[symbol]['quantity'] == 0:
+            del portfolio[symbol]
+
+def trade_loop():
+    """
+    Main trading loop to continuously monitor and trade based on signals.
+    """
+    global trade_history
+    while True:
+        try:
+            # Fetch trending stocks
+            trending_stocks = fetch_trending_stocks()
+            
+            for symbol in trending_stocks:
+                # Fetch and analyze data
+                data = fetch_data(symbol, timeframe='1D', limit=100)
+                if data is None:
+                    continue
+                
+                # Generate signals
+                signals = generate_signals(data)
+                
+                for signal in signals:
+                    # Execute trades based on signals
+                    execute_trade(signal, symbol)
+                    update_portfolio(symbol, signal, 1)  # Adjust quantity as needed
+                    trade_history.append({'timestamp': datetime.now(), 'symbol': symbol, 'signal': signal})
+                    
+                # Fetch and analyze news
+                news_articles = fetch_news(symbol)
+                if sentiment_model:
+                    news_sentiments = [sentiment_model.predict([article['title'] + ' ' + article['description']])[0] for article in news_articles]
+                    sentiment_score = np.mean(news_sentiments)
+                    logging.info(f"Sentiment score for {symbol}: {sentiment_score}")
+                
+            time.sleep(60)  # Run every minute
+        except Exception as e:
+            logging.error(f"Error in trading loop: {e}")
+            time.sleep(60)
+
+if __name__ == "__main__":
+    trade_loop()
+
+
+############################################## OLD ################################################
+
+import time
+import logging
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+import ccxt
+import yfinance as yf
+import requests
+from alpaca_trade_api.rest import REST, TimeFrame, TimeFrameUnit
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.datasets import fetch_20newsgroups
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv()
+ALPACA_API_KEY = os.getenv('ALPACA_API_KEY')
+ALPACA_API_SECRET = os.getenv('ALPACA_API_SECRET')
+ALPACA_BASE_URL = os.getenv('ALPACA_BASE_URL', 'https://paper-api.alpaca.markets')
+NEWS_API_KEY = os.getenv('NEWS_API_KEY')
+
+# Initialize logging
+from logging.handlers import RotatingFileHandler
+handler = RotatingFileHandler('trading_algorithm.log', maxBytes=5*1024*1024, backupCount=5)
+logging.basicConfig(handlers=[handler], level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Initialize Alpaca API
+api = REST(ALPACA_API_KEY, ALPACA_API_SECRET, base_url=ALPACA_BASE_URL)
+
+# Initialize data structures to track performance
+portfolio = {}
+trade_history = []
+net_profit_loss = 0
+
+# Initialize sentiment analysis model
+def initialize_sentiment_model():
+    try:
+        logging.info("Initializing sentiment analysis model...")
+        categories = ['rec.sport.baseball', 'rec.sport.hockey']
+        data = fetch_20newsgroups(subset='train', categories=categories)
+        pipeline = Pipeline([
+            ('vectorizer', CountVectorizer()),
+            ('classifier', MultinomialNB())
+        ])
+        pipeline.fit(data.data, data.target)
+        logging.info("Sentiment analysis model initialized successfully.")
+        return pipeline
+    except Exception as e:
+        logging.error(f"Error initializing sentiment model: {e}")
+        return None
+
+sentiment_model = initialize_sentiment_model()
+
+##############################################
+#                Data Fetching               #
+##############################################
+
+def fetch_trending_stocks(limit=10):
+    """
+    Fetch trending stocks based on highest volume and market cap.
+    """
+    try:
+        logging.info("Fetching trending stocks...")
+        # Fetch S&P 500 tickers
+        sp500_tickers = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]['Symbol'].tolist()
+        
+        # Fetch market data for these tickers
+        data = yf.download(sp500_tickers, period='1d', group_by='ticker', threads=True, progress=False)
+        
+        # Calculate average volume and sort
+        avg_volumes = {}
+        for ticker in sp500_tickers:
+            try:
+                avg_volume = data[ticker]['Volume'].mean()
+                avg_volumes[ticker] = avg_volume
+            except Exception as e:
+                continue
+        
+        # Sort tickers by volume
+        sorted_tickers = sorted(avg_volumes.items(), key=lambda x: x[1], reverse=True)
+        trending_stocks = [ticker for ticker, volume in sorted_tickers[:limit]]
+        
+        logging.info(f"Trending stocks fetched: {trending_stocks}")
+        return trending_stocks
+    except Exception as e:
+        logging.error(f"Error fetching trending stocks: {e}")
+        return []
+
+def fetch_data(symbol, timeframe='1D', limit=100):
+    """
+    Fetch historical market data for a given symbol and timeframe.
+    """
+    try:
+        logging.info(f"Fetching data for {symbol} with timeframe {timeframe}...")
+        timeframe_map = {
+            '1D': TimeFrame.Day,
+            '1H': TimeFrame.Hour,
+            '15M': TimeFrame(15, TimeFrameUnit.Minute)
+        }
+        bars = api.get_bars(symbol, timeframe_map[timeframe], limit=limit).df
+        bars = bars.tz_convert('US/Eastern')
+        logging.info(f"Data fetched for {symbol}: {len(bars)} bars.")
+        return bars
+    except Exception as e:
+        logging.error(f"Error fetching data for {symbol}: {e}")
+        return None
+
+def fetch_news(symbol, from_date=None, to_date=None, language='en'):
+    """
+    Fetch recent news articles for a given stock symbol.
+    """
+    try:
+        logging.info(f"Fetching news for {symbol}...")
+        if from_date is None:
+            from_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        if to_date is None:
+            to_date = datetime.now().strftime('%Y-%m-%d')
+        
+        url = (
+            f"https://newsapi.org/v2/everything?"
+            f"q={symbol}&from={from_date}&to={to_date}&language={language}&sortBy=publishedAt&apiKey={NEWS_API_KEY}"
+        )
+        response = requests.get(url)
+        response.raise_for_status()
+        articles = response.json().get('articles', [])
+        logging.info(f"Fetched {len(articles)} articles for {symbol}.")
+        return articles
+    except Exception as e:
+        logging.error(f"Error fetching news for {symbol}: {e}")
+        return []
+
+##############################################
+#            Technical Indicators            #
+##############################################
+
+def calculate_rsi(prices, period=14):
+    """
+    Calculate Relative Strength Index (RSI) for a series of prices.
+    """
+    try:
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    except Exception as e:
+        logging.error(f"Error calculating RSI: {e}")
+        return pd.Series()
+
+def calculate_macd(prices):
+    """
+    Calculate Moving Average Convergence Divergence (MACD) for a series of prices.
+    """
+    try:
+        ema12 = prices.ewm(span=12, adjust=False).mean()
+        ema26 = prices.ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        signal = macd.ewm(span=9, adjust=False).mean()
+        histogram = macd - signal
+        return macd, signal, histogram
+    except Exception as e:
+        logging.error(f"Error calculating MACD: {e}")
+        return pd.Series(), pd.Series(), pd.Series()
+
+def calculate_bollinger_bands(prices, window=20):
+    """
+    Calculate Bollinger Bands for a series of prices.
+    """
+    try:
+        sma = prices.rolling(window=window).mean()
+        std = prices.rolling(window=window).std()
+        upper_band = sma + (std * 2)
+        lower_band = sma - (std * 2)
+        return upper_band, sma, lower_band
+    except Exception as e:
+        logging.error(f"Error calculating Bollinger Bands: {e}")
+        return pd.Series(), pd.Series(), pd.Series()
+
+def calculate_indicators(data):
+    """
+    Calculate all necessary technical indicators and add them to the data DataFrame.
+    """
+    try:
+        data = data.copy()
+        data['RSI'] = calculate_rsi(data['close'])
+        data['MACD'], data['MACD_Signal'], data['MACD_Hist'] = calculate_macd(data['close'])
+        data['MA_50'] = data['close'].rolling(window=50).mean()
+        data['MA_200'] = data['close'].rolling(window=200).mean()
+        data['Upper_Band'], data['Middle_Band'], data['Lower_Band'] = calculate_bollinger_bands(data['close'])
+        logging.info("Technical indicators calculated.")
+        return data
+    except Exception as e:
+        logging.error(f"Error calculating indicators: {e}")
+        return data
+
+##############################################
+#          Advanced Pattern Detection        #
+##############################################
+
+def detect_divergence(data):
+    """
+    Detect bullish or bearish divergences between price and RSI.
+    """
+    try:
+        divergence_signals = []
+        # Ensure sufficient data
+        if len(data) < 30:
+            return divergence_signals
+        
+        # Recent price and RSI changes
+        price_diff = data['close'].iloc[-3:] - data['close'].iloc[-4:-1]
+        rsi_diff = data['RSI'].iloc[-3:] - data['RSI'].iloc[-4:-1]
+        
+        # Bullish divergence: price makes lower lows, RSI makes higher lows
+        if price_diff.iloc[-1] < 0 and rsi_diff.iloc[-1] > 0:
+            divergence_signals.append('bullish divergence')
+        
+        # Bearish divergence: price makes higher highs, RSI makes lower highs
+        if price_diff.iloc[-1] > 0 and rsi_diff.iloc[-1] < 0:
+            divergence_signals.append('bearish divergence')
+        
+        logging.info(f"Divergence signals: {divergence_signals}")
+        return divergence_signals
+    except Exception as e:
+        logging.error(f"Error detecting divergence: {e}")
+        return []
+
+def detect_smt(data, related_symbol='SPY'):
+    """
+    Detect Smart Money Techniques (SMT) by comparing the target symbol with a related market index.
+    """
+    try:
+        smt_signals = []
+        related_data = fetch_data(related_symbol, '1D')
+        if related_data is None or len(related_data) < 2 or len(data) < 2:
+            return smt_signals
+        
+        # Compare recent price movements
+        symbol_change = data['close'].pct_change().iloc[-1]
+        related_change = related_data['close'].pct_change().iloc[-1]
+        
+        # Bullish SMT: symbol down, related index up
+        if symbol_change < 0 and related_change > 0:
+            smt_signals.append('bullish SMT divergence')
+        
+        # Bearish SMT: symbol up, related index down
+        if symbol_change > 0 and related_change < 0:
+            smt_signals.append('bearish SMT divergence')
+        
+        logging.info(f"SMT signals: {smt_signals}")
+        return smt_signals
+    except Exception as e:
+        logging.error(f"Error detecting SMT: {e}")
+        return []
+
+def detect_fair_value_gaps(data):
+    """
+    Detect Fair Value Gaps (FVG) in price data.
+    """
+    try:
+        fvg_signals = []
+        for i in range(2, len(data)):
+            prev_high = data['high'].iloc[i - 2]
+            prev_low = data['low'].iloc[i - 2]
+            curr_high = data['high'].iloc[i]
+            curr_low = data['low'].iloc[i]
+            
+            # Bullish FVG: current low > previous high
+            if curr_low > prev_high:
+                fvg_signals.append({
+                    'type': 'bullish',
+                    'gap': (prev_high, curr_low),
+                    'timestamp': data.index[i]
+                })
+            # Bearish FVG: current high < previous low
+            elif curr_high < prev_low:
+                fvg_signals.append({
+                    'type': 'bearish',
+                    'gap': (curr_high, prev_low),
+                    'timestamp': data.index[i]
+                })
+        logging.info(f"Fair Value Gaps detected: {len(fvg_signals)}")
+        return fvg_signals
+    except Exception as e:
+        logging.error(f"Error detecting fair value gaps: {e}")
+        return []
+
+##############################################
+#           News Sentiment Analysis          #
+##############################################
+
+def news_sentiment_analysis(articles):
+    """
+    Analyze sentiment of news articles using the pre-trained sentiment model.
+    """
+    try:
+        if not articles:
+            return 0  # Neutral sentiment if no articles
+        
+        texts = [article['title'] + ' ' + article.get('description', '') for article in articles]
+        sentiments = sentiment_model.predict(texts)
+        # Assuming '1' is positive sentiment and '0' is negative
+        sentiment_score = np.mean(sentiments)
+        logging.info(f"Calculated sentiment score: {sentiment_score}")
+        return sentiment_score
+    except Exception as e:
+        logging.error(f"Error in news sentiment analysis: {e}")
+        return 0
+
+##############################################
+#           Trading Decision Making          #
+##############################################
+
+def determine_trade_signal(data):
+    """
+    Determine trade signal based on technical indicators and pattern detection.
+    """
+    try:
+        latest_data = data.iloc[-1]
+        signals = []
+        
+        # Simple Moving Average Crossover
+        if latest_data['MA_50'] > latest_data['MA_200']:
+            signals.append('bullish')
+        elif latest_data['MA_50'] < latest_data['MA_200']:
+            signals.append('bearish')
+        
+        # RSI Overbought/Oversold
+        if latest_data['RSI'] < 30:
+            signals.append('bullish')
+        elif latest_data['RSI'] > 70:
+            signals.append('bearish')
+        
+        # MACD Crossover
+        if latest_data['MACD'] > latest_data['MACD_Signal']:
+            signals.append('bullish')
+        elif latest_data['MACD'] < latest_data['MACD_Signal']:
+            signals.append('bearish')
+        
+        # Consolidate signals
+        if signals.count('bullish') > signals.count('bearish'):
+            return 'Buy'
+        elif signals.count('bearish') > signals.count('bullish'):
+            return 'Sell'
+        else:
+            return 'Hold'
+    except Exception as e:
+        logging.error(f"Error determining trade signal: {e}")
+        return 'Hold'
+
+def calculate_risk_reward(entry_price, stop_loss, take_profit):
+    """
+    Calculate risk-reward ratio for a potential trade.
+    """
+    try:
+        risk = abs(entry_price - stop_loss)
+        reward = abs(take_profit - entry_price)
+        rr_ratio = reward / risk if risk != 0 else 0
+        logging.info(f"Calculated risk/reward ratio: {rr_ratio}")
+        return rr_ratio
+    except Exception as e:
+        logging.error(f"Error calculating risk/reward ratio: {e}")
+        return 0
+
+##############################################
+#             Trade Execution                #
+##############################################
+
+def execute_trade(action, symbol, quantity=1):
+    """
+    Execute trade based on action ('Buy' or 'Sell') for a given symbol and quantity.
+    """
+    try:
+        logging.info(f"Executing {action} order for {symbol}...")
+        market_price = api.get_last_quote(symbol).askprice
+        if market_price == 0:
+            market_price = api.get_last_quote(symbol).bidprice
+        
+        if action == 'Buy':
+            order = api.submit_order(
+                symbol=symbol,
+                qty=quantity,
+                side='buy',
+                type='market',
+                time_in_force='gtc'
+            )
+            portfolio[symbol] = {
+                'quantity': quantity,
+                'entry_price': market_price,
+                'entry_time': datetime.now()
+            }
+            logging.info(f"Bought {quantity} shares of {symbol} at {market_price}")
+        elif action == 'Sell' and symbol in portfolio:
+            order = api.submit_order(
+                symbol=symbol,
+                qty=quantity,
+                side='sell',
+                type='market',
+                time_in_force='gtc'
+            )
+            entry = portfolio.pop(symbol)
+            profit_loss = (market_price - entry['entry_price']) * quantity
+            global net_profit_loss
+            net_profit_loss += profit_loss
+            trade_history.append({
+                'symbol': symbol,
+                'quantity': quantity,
+                'entry_price': entry['entry_price'],
+                'exit_price': market_price,
+                'profit_loss': profit_loss,
+                'holding_period': (datetime.now() - entry['entry_time']).total_seconds() / 3600  # in hours
+            })
+            logging.info(f"Sold {quantity} shares of {symbol} at {market_price}, P&L: {profit_loss}")
+        else:
+            logging.warning(f"No position to sell for {symbol}")
+    except Exception as e:
+        logging.error(f"Error executing trade for {symbol}: {e}")
+
+##############################################
+#              Main Trading Loop             #
+##############################################
+
+def trading_algorithm():
+    """
+    Main trading algorithm that scouts for stocks, analyzes them, and executes trades.
+    """
+    try:
+        logging.info("Starting trading algorithm iteration...")
+        trending_stocks = fetch_trending_stocks()
+        for symbol in trending_stocks:
+            data = fetch_data(symbol, timeframe='1D', limit=200)
+            if data is None or data.empty:
+                continue
+            data = calculate_indicators(data)
+            
+            # Pattern detections
+            divergence_signals = detect_divergence(data)
+            smt_signals = detect_smt(data)
+            fvg_signals = detect_fair_value_gaps(data)
+            
+            # News sentiment
+            articles = fetch_news(symbol)
+            sentiment_score = news_sentiment_analysis(articles)
+            
+            # Determine trade action
+            trade_signal = determine_trade_signal(data)
+            
+            # Consider sentiment and pattern detections
+            if sentiment_score > 0.6 and 'bullish divergence' in divergence_signals and trade_signal == 'Buy':
+                execute_trade('Buy', symbol)
+            elif sentiment_score < 0.4 and 'bearish divergence' in divergence_signals and trade_signal == 'Sell':
+                execute_trade('Sell', symbol)
+            else:
+                logging.info(f"No clear trade signal for {symbol}")
+        
+        logging.info("Trading algorithm iteration completed.")
+    except Exception as e:
+        logging.error(f"Error in trading algorithm: {e}")
+
+def monitor_positions():
+    """
+    Monitor open positions and decide whether to close them based on updated signals.
+    """
+    try:
+        logging.info("Monitoring open positions...")
+        for symbol in list(portfolio.keys()):
+            data = fetch_data(symbol, timeframe='1D', limit=200)
+            if data is None or data.empty:
+                continue
+            data = calculate_indicators(data)
+            trade_signal = determine_trade_signal(data)
+            
+            if trade_signal == 'Sell':
+                execute_trade('Sell', symbol)
+            else:
+                logging.info(f"Holding position for {symbol}")
+    except Exception as e:
+        logging.error(f"Error monitoring positions: {e}")
+
+def display_dashboard():
+    """
+    Display current portfolio status and trade history.
+    """
+    try:
+        logging.info("Displaying dashboard...")
+        logging.info(f"Current Portfolio: {portfolio}")
+        logging.info(f"Trade History: {trade_history}")
+        logging.info(f"Net Profit/Loss: {net_profit_loss}")
+    except Exception as e:
+        logging.error(f"Error displaying dashboard: {e}")
+
+def main():
+    """
+    Main function to run the trading bot continuously.
+    """
+    while True:
+        try:
+            trading_hours = api.get_clock()
+            if trading_hours.is_open:
+                trading_algorithm()
+                monitor_positions()
+                display_dashboard()
+            else:
+                logging.info("Market is closed. Waiting for next trading session...")
+            time.sleep(3600)  # Wait for an hour before next iteration
+        except Exception as e:
+            logging.error(f"Error in main loop: {e}")
+            time.sleep(300)  # Wait for 5 minutes before retrying
+
+if __name__ == "__main__":
+    main()

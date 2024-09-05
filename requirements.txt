@@ -1,0 +1,8 @@
+pandas
+numpy
+ccxt
+yfinance
+requests
+alpaca-trade-api
+scikit-learn
+python-dotenv
