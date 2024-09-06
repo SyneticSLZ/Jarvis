@@ -2,3 +2,15 @@ ALPACA_API_KEY=PKGANVQRWYQSDGZ7YKWI
 ALPACA_API_SECRET=F2ZrFa8teVTRkHjrGKnE5EBfVaKvqdh7fJy7rqGv
 ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2
 NEWS_API_KEY=af2ada1b2b3146b0b1af57120d39faa9
+
+
+executing trades
+Prepared BUY order for NVDA: Entry=107.055, Stop Loss=nan, Take Profit=nan, Use Trailing Stop=False
+executing trades
+Prepared BUY order for F: Entry=10.7675, Stop Loss=nan, Take Profit=nan, Use Trailing Stop=False
+executing trades
+Prepared BUY order for BAC: Entry=40.405, Stop Loss=nan, Take Profit=nan, Use Trailing Stop=False
+executing trades
+Prepared BUY order for AMD: Entry=139.59, Stop Loss=nan, Take Profit=nan, Use Trailing Stop=False
+executing trades
+Prepared BUY order for APA: Entry=26.11, Stop Loss=nan, Take Profit=nan, Use Trailing Stop=False

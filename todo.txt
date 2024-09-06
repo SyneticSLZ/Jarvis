@@ -1,0 +1,15 @@
+- sync across different exchanges 
+- sentiment analysis for news articcles feeding into volatility
+- reccomended sell, buy times 
+- more advances logic for take profit
+- check if stocks r available on exchange broker while fethcing 
+- more advanced fetch algo 
+- check balance and set order quantity accordingly
+- dashboard and email updates 
+- include covariance ( somehow ) 
+- twitter api for news too
+- news to make other decisions 
+- more indicators and advanced pattern recognition 
+- backtest and papertrade
+- monitor hourly and just efore close 
+- also on market open get all open orders and monitor 

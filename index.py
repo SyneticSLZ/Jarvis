@@ -1,5 +1,21 @@
 # THIS IS JARVIS.
 #Dependencies
+#TO_DO
+#- sync across different exchanges 
+#- sentiment analysis for news articcles feeding into volatility
+#- reccomended sell, buy times 
+#- more advances logic for take profit
+#- check if stocks r available on exchange broker while fethcing 
+#- more advanced fetch algo 
+#- check balance and set order quantity accordingly
+#- dashboard and email updates 
+#- include covariance ( somehow ) 
+#- twitter api for news too
+#- news to make other decisions 
+#- more indicators and advanced pattern recognition 
+#- backtest and papertrade
+#- monitor hourly and just efore close 
+#- also on market open get all open orders and monitor 
 # TRADING API HERE /////////////////////////////////////////////
 import time
 import logging
@@ -215,42 +231,53 @@ def calculate_macd(prices):
         logging.error(f"Error calculating MACD: {e}")
         return pd.Series(), pd.Series(), pd.Series()
     
-def calculate_atr(df, period=14):
+def calculate_atr(high, low, close, period=14, method='sma', default_atr_value=1.0, min_periods=5):
     """
     Calculate the Average True Range (ATR) for volatility measurement.
-    :param df: DataFrame containing historical data with 'high', 'low', and 'close' columns.
-    :param period: Period over which to calculate ATR.
+
+    :param high: Series containing the high prices.
+    :param low: Series containing the low prices.
+    :param close: Series containing the close prices.
+    :param period: Period over which to calculate ATR (default is 14).
+    :param method: Method to calculate ATR ('sma' for simple moving average, 'ema' for exponential moving average).
     :return: Series representing the ATR.
     """
-    if df.empty:
-        logging.error("DataFrame is empty, cannot calculate ATR.")
-        return pd.Series(dtype=float)
+    try:
+        print("Calculating ATR...")
+        logging.info("Calculating ATR...")
+        if high.empty or low.empty or close.empty:
+            logging.error("High, low, or close price data is empty, cannot calculate ATR.")
+            return pd.Series([default_atr_value] * len(high))  # Return a default ATR series
 
-    # Ensure the necessary columns exist
-    if not {'high', 'low', 'close'}.issubset(df.columns):
-        logging.error("Required columns are missing from DataFrame.")
-        return pd.Series(dtype=float)
+        # Calculate True Range (TR)
+        previous_close = close.shift(1)
+        high_low = high - low
+        high_prev_close = abs(high - previous_close)
+        low_prev_close = abs(low - previous_close)
+        tr = np.maximum(high_low, np.maximum(high_prev_close, low_prev_close))
 
-    # Shift the 'close' column to get the previous day's close
-    df['previous_close'] = df['close'].shift(1)
+        # Calculate ATR (SMA or EMA)
+        if method == 'sma':
+            atr = tr.rolling(window=period, min_periods=min_periods).mean()
+        elif method == 'ema':
+            atr = tr.ewm(span=period, adjust=False, min_periods=min_periods).mean()
+        else:
+            logging.error(f"Unknown method '{method}' specified for ATR calculation.")
+            return pd.Series([default_atr_value] * len(high))  # Return default ATR if method is unknown
 
-    # Calculate True Range (TR)
-    df['TR'] = df.apply(
-        lambda row: max(
-            row['high'] - row['low'], 
-            abs(row['high'] - row['previous_close']), 
-            abs(row['low'] - row['previous_close'])
-        ), axis=1)
+        # Fill NaN values with forward or backward filling
+        atr.fillna(method='bfill', inplace=True)  # Use previous values if available
+        atr.fillna(default_atr_value, inplace=True)  # Replace any remaining NaN with default
 
-    # Calculate ATR
-    df['ATR'] = df['TR'].rolling(window=period).mean()
+        # Optionally enforce a minimum ATR value (if necessary)
+        atr = atr.apply(lambda x: max(x, default_atr_value))
 
-    # Clean up temporary columns
-    df.drop(columns=['TR', 'previous_close'], inplace=True)
-
-    print("ATR calculated.")
-    logging.info("ATR calculated.")
-    return df['ATR']
+        logging.info(f"ATR calculation completed with a default fallback. ATR: {atr}")
+        return atr
+    except Exception as e:
+        print(f"Error calculating ATR: {e}")
+        logging.error(f"Error calculating ATR: {e}")
+        return pd.Series([])
 
 
 
@@ -291,7 +318,7 @@ def calculate_indicators(data):
         data['MACD'], data['MACD_Signal'], data['MACD_Hist'] = calculate_macd(data['close'])
         data['MA_50'] = data['close'].rolling(window=50).mean()
         data['MA_200'] = data['close'].rolling(window=200).mean()
-        data['ATR'] = calculate_atr(df)
+        data['ATR'] = calculate_atr(data['high'], data['low'], data['close'], period=14, default_atr_value=1.5)
         data['Upper_Band'], data['Middle_Band'], data['Lower_Band'] = calculate_bollinger_bands(data['close'])
         print("Technical indicators calculated.")
         logging.info("Technical indicators calculated.")
@@ -697,6 +724,7 @@ def pre_market_analysis(symbol):
     if 'ATR' not in higher_timeframe_data.columns:
         print("ATR was not calculated.")
         logging.error("ATR was not calculated.")
+        return None, None
 
     if not bias:
         print(f"Could not determine market bias for {symbol}.")
@@ -704,8 +732,23 @@ def pre_market_analysis(symbol):
 
     # Analyze lower timeframes and set trade price points
     lower_timeframe_signals, rsi = analyze_lower_timeframes(symbol, bias)
+
+    # Ensure ATR is usable and non-NaN
+    atr_value = higher_timeframe_data['ATR'].iloc[-1]
+    if pd.isna(atr_value):
+        print("ATR value is NaN, unable to calculate risk.")
+        logging.error("ATR value is NaN, unable to calculate risk.")
+        return None, None
+
+    print(f"higher_timeframe_data['ATR']: {atr_value}")
+    
+    # Calculate volatility and risk management values
+    volatility = atr_value
+
     volatility = higher_timeframe_data['ATR'].iloc[-1]  # Example: Using ATR for volatility
-    risk_percentage = calculate_risk_percentage(volatility, risk_tolerance=0.02)  # Example risk tolerance of 2%
+    print(f"volatility: {volatility}, rt: 0.02")
+
+    risk_percentage = calculate_risk_percentage(volatility, 0.02)  # Example risk tolerance of 2%
     reward_to_risk_ratio = calculate_reward_to_risk_ratio(bias)  # Example reward-to-risk ratio
 
 
@@ -713,8 +756,10 @@ def pre_market_analysis(symbol):
     for signal in lower_timeframe_signals:
         if signal == 'buy':
             entry_price = higher_timeframe_data['close'].iloc[-1]
+            print("entry :  ", entry_price, "rp : ", risk_percentage)
             stop_loss = calculate_stop_loss(entry_price, risk_percentage)
             take_profit = calculate_take_profit(entry_price, reward_to_risk_ratio, stop_loss)
+            print("sl :  ", stop_loss, "tp : ", take_profit)
             trade_price_points.append({
                 'action': 'buy',
                 'entry_price': entry_price,
@@ -724,8 +769,10 @@ def pre_market_analysis(symbol):
             })
         elif signal == 'sell':
             entry_price = higher_timeframe_data['close'].iloc[-1]
+            print("entry :  ", entry_price, "rp : ", risk_percentage)
             stop_loss = calculate_stop_loss(entry_price, risk_percentage)
             take_profit = calculate_take_profit(entry_price, reward_to_risk_ratio, stop_loss)
+            print("sl :  ", stop_loss, "tp : ", take_profit)
             trade_price_points.append({
                 'action': 'sell',
                 'entry_price': entry_price,
@@ -896,22 +943,23 @@ def main_trading_routine():
         execute_trades(symbol, trade_points, rsi, bias)
 
     # Continuous in-market analysis and execution
-    while True:
-        for symbol in trending_stocks:
-            if symbol in trade_setups:
-                lower_timeframe_signals, rsi = analyze_lower_timeframes(symbol, trade_setups[symbol][0]['action'])
+    # while True:
+    # print(trade_setups)
+    # for symbol in trending_stocks:
+            # if symbol in trade_setups:
+                # lower_timeframe_signals, rsi = analyze_lower_timeframes(symbol, trade_setups[symbol][0]['action'])
                 
             # Execute trades or adjust positions based on new analysis
             # for signal in lower_timeframe_signals:
                 # if signal == 'buy' or signal == 'sell':
 
-            for signal in lower_timeframe_signals:
-                if signal in ['buy', 'sell']:
-                    execute_trades(symbol, trade_setups[symbol], rsi, bias)
+                # for signal in lower_timeframe_signals:
+                    # if signal in ['buy', 'sell']:
+                        # execute_trades(symbol, trade_setups[symbol], rsi, bias)
 
 
         # Wait for the next interval (e.g., 15 minutes)
-        time.sleep(900)  # 15 minutes
+    # time.sleep(900)  # 15 minutes
 
     # while True:
     # for symbol in trending_stocks:
